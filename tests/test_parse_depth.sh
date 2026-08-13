@@ -96,6 +96,40 @@ check_rc_out() {
     fi
 }
 
+run_parse_capture() {
+    # Capture stderr separately: the bounded-diagnostic contract is about the
+    # parser's diagnostic stream, not any unrelated stdout from the runtime.
+    local mode="$1" file="$2"
+    if [ "$mode" = plain ]; then
+        "$BIN" "$file" >"$ELIF_TMP/stdout" 2>"$ELIF_TMP/stderr"
+    else
+        "$BIN" --lint "$file" >"$ELIF_TMP/stdout" 2>"$ELIF_TMP/stderr"
+    fi
+    RC=$?
+    OUT=$(<"$ELIF_TMP/stderr")
+    STDERR_LINES=$(wc -l < "$ELIF_TMP/stderr")
+}
+
+check_parse_contract() {
+    # check_parse_contract NAME WANT_RC WANT_SUBSTR WANT_ERRORS MAX_STDERR_LINES
+    #                        RC STDERR_LINES STDERR
+    local name="$1" want_rc="$2" want_substr="$3" want_errors="$4"
+    local max_stderr_lines="$5" rc="$6" stderr_lines="$7" stderr="$8"
+    local got_errors
+    got_errors=$(printf '%s\n' "$stderr" |
+        grep -Eo '[[:digit:]]+ parse error\(s\)' |
+        tail -1 | cut -d' ' -f1)
+    if [ "$rc" -eq "$want_rc" ] &&
+       [ "$got_errors" = "$want_errors" ] &&
+       [ "$stderr_lines" -le "$max_stderr_lines" ] &&
+       printf '%s' "$stderr" | grep -qF "$want_substr"; then
+        echo "  PASS: $name (rc=$rc, errors=$got_errors, stderr_lines=$stderr_lines)"
+    else
+        echo "  FAIL: $name (rc=$rc, errors=${got_errors:-none}, stderr_lines=$stderr_lines, wanted rc=$want_rc, errors=$want_errors, stderr_lines<=$max_stderr_lines)"
+        printf '%s\n' "$stderr" | head -3 | sed 's/^/    /'
+    fi
+}
+
 ELIF_TMP=$(mktemp -d /tmp/eigs_elif_XXXXXX)
 
 # Below the bound: unchanged behaviour, both modes.
@@ -130,37 +164,27 @@ check_rc_out "252-elif chain: --lint is a PARSE error" 1 \
 # set of parse diagnostics in BOTH modes, no longer reaching the compiler
 # (and, past ~12,800 arms, no longer crashing).
 gen_elif_chain 258 "$ELIF_TMP/c258.eigs"
-OUT=$("$BIN" "$ELIF_TMP/c258.eigs" 2>&1); RC=$?
-check_rc_out "257-elif chain: plain run is a PARSE error" 1 \
-    "parse error(s)" "$RC" "$OUT"
+run_parse_capture plain "$ELIF_TMP/c258.eigs"
+check_parse_contract "257-elif chain: plain run has the bounded PARSE diagnostic" 1 \
+    "parse error(s)" 8 12 "$RC" "$STDERR_LINES" "$OUT"
 if printf '%s' "$OUT" | grep -qF "too deep to compile"; then
     echo "  FAIL: 257-elif chain still reports the COMPILE depth limit"
     printf '%s\n' "$OUT" | head -3 | sed 's/^/    /'
 else
     echo "  PASS: 257-elif chain no longer reaches the compiler"
 fi
-OUT=$("$BIN" --lint "$ELIF_TMP/c258.eigs" 2>&1); RC=$?
-check_rc_out "257-elif chain: --lint is a PARSE error" 1 \
-    "parse error(s) [E002]" "$RC" "$OUT"
+run_parse_capture lint "$ELIF_TMP/c258.eigs"
+check_parse_contract "257-elif chain: --lint has the bounded PARSE diagnostic" 1 \
+    "parse error(s) [E002]" 8 12 "$RC" "$STDERR_LINES" "$OUT"
 
 # 14,000 arms was rc=139 (SIGSEGV) in both modes; now a clean refusal.
 gen_elif_chain 14000 "$ELIF_TMP/c14000.eigs"
-OUT=$("$BIN" "$ELIF_TMP/c14000.eigs" 2>&1); RC=$?
-if [ "$RC" -eq 139 ] || [ "$RC" -eq 134 ] || [ "$RC" -eq 0 ]; then
-    echo "  FAIL: 14000-arm chain plain run (crash or silent success, rc=$RC)"
-elif printf '%s' "$OUT" | grep -qF "parse error(s)"; then
-    echo "  PASS: 14000-arm chain plain run refused cleanly (rc=$RC)"
-else
-    echo "  FAIL: 14000-arm chain plain run lacks a parse diagnostic (rc=$RC)"
-fi
-OUT=$("$BIN" --lint "$ELIF_TMP/c14000.eigs" 2>&1); RC=$?
-if [ "$RC" -eq 139 ] || [ "$RC" -eq 134 ] || [ "$RC" -eq 0 ]; then
-    echo "  FAIL: 14000-arm chain --lint (crash or silent success, rc=$RC)"
-elif printf '%s' "$OUT" | grep -qF "parse error(s) [E002]"; then
-    echo "  PASS: 14000-arm chain --lint refused cleanly (rc=$RC)"
-else
-    echo "  FAIL: 14000-arm chain --lint lacks a parse diagnostic (rc=$RC)"
-fi
+run_parse_capture plain "$ELIF_TMP/c14000.eigs"
+check_parse_contract "14000-arm chain plain run has the bounded PARSE diagnostic" 1 \
+    "parse error(s)" 8 12 "$RC" "$STDERR_LINES" "$OUT"
+run_parse_capture lint "$ELIF_TMP/c14000.eigs"
+check_parse_contract "14000-arm chain --lint has the bounded PARSE diagnostic" 1 \
+    "parse error(s) [E002]" 8 12 "$RC" "$STDERR_LINES" "$OUT"
 
 # Depth is charged per statement: a chain just under the bound releases its
 # charge when it ends, so the statement after it parses with a full budget.
