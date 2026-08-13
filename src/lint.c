@@ -1344,15 +1344,25 @@ static void check_outer_mutation(ASTNode *ast, LintContext *ctx) {
  *   chain-continuation nodes are consumed by the flattening rather than
  *   re-scanned as chain heads — an if/elif/else never double-fires against
  *   its own tail.
- * - A name with a function-local binding OUTSIDE the chain is exempt: a bare
- *   `is` binds the innermost existing outward binding, so when a parameter or
- *   an already-established `local` carries the name, the bare write binds
- *   THAT, not an outer scope, and the sibling `local` has a benign reading.
- *   The evidence is threaded in source order so only bindings that dominate
- *   the chain count — deliberately NOT a whole-function local sweep, which
- *   would swallow the in-chain `local` that makes the true positive
- *   detectable. (W015's comment: under-collecting evidence is the cardinal
- *   sin; over-collecting at worst silences a warning.)
+ * - A name with a function-local binding OUTSIDE the chain is exempt: the
+ *   bare write then binds that binding, not an outer scope, and the sibling
+ *   `local` has a benign reading. What counts as a function-local binding is
+ *   the COMPILER's notion, not a hand-enumerated list of binder node types
+ *   (hand enumeration is uncompletable — each shipped round of it closed the
+ *   named classes and opened new ones): a parameter; a `local` established
+ *   earlier in source order (threaded with mark/restore so only bindings
+ *   that dominate the chain count — deliberately NOT a whole-function local
+ *   sweep, which would swallow the in-chain `local` that makes the true
+ *   positive detectable); the function-wide env-bound set shared verbatim
+ *   from the compiler (eigs_scan_env_bound — `catch` error-names and
+ *   listcomp variables, whose every write in the scope the compiler forces
+ *   onto the current-scope path, position-independent); and an enclosing
+ *   `for` variable within its own loop body only (the runtime tears the
+ *   loop binding down at loop exit). Module-level bindings are the outward
+ *   targets this warning exists for, never evidence: a top-level function
+ *   starts its evidence stack empty. (W015's comment: under-collecting
+ *   evidence is the cardinal sin; over-collecting at worst silences a
+ *   warning.)
  * - No overlap with W015 by construction: W015 stays silent on any name that
  *   is `local`-declared anywhere in the same function body, and W023 fires
  *   only on names that are. */
@@ -1361,26 +1371,36 @@ static void check_outer_mutation(ASTNode *ast, LintContext *ctx) {
 
 typedef struct { ASTNode **stmts; int count; } W023Branch;
 
-/* Function-local bindings established OUTSIDE the chain under review. A bare
- * `x is ...` binds the innermost existing outward binding, so when one of
- * these names is in scope the sibling-`local` evidence has a benign reading
- * and warning would be a false positive (a same-name parameter, or a `local`
- * declared earlier in the same body — both verified against the runtime,
- * which leaves the module binding untouched). One stack per file, threaded
- * with mark/restore so a binding is visible only where it dominates: params
- * are pushed on function entry, body statements are walked in source order
- * pushing their binders, and each exclusive or maybe-never-executed body
- * (chain branch, loop body, try/catch, match arm) walks in a fresh region so
- * its bindings leak neither sideways nor backwards. Nested functions inherit
- * the enclosing stack: outward `is` resolution crosses the function boundary
- * (a nested bare write binds an enclosing `local`), so enclosing locals are
- * valid evidence there. Borrowed AST pointers; truncation frees nothing. */
+/* Function-local bindings established OUTSIDE the chain under review, in the
+ * COMPILER's sense of binding (see the rule comment above): parameters,
+ * source-order `local`s, the shared env-bound set, and the enclosing `for`
+ * variable inside its own body. A bare `x is ...` on one of these names binds
+ * function-locally — the module binding is untouched, verified against the
+ * runtime — so the sibling-`local` evidence has a benign reading and warning
+ * would be a false positive. One stack per file, threaded with mark/restore
+ * so a binding is visible only where it dominates: a top-level function
+ * starts EMPTY (module-level bindings are outward targets, not evidence),
+ * with its params and the whole-body env-bound set pushed at entry; body
+ * statements are walked in source order pushing their `local`s; and each
+ * exclusive or maybe-never-executed body (chain branch, loop body, try/catch,
+ * match arm) walks in a fresh region so its bindings leak neither sideways
+ * nor backwards. Nested functions inherit the enclosing stack: outward `is`
+ * resolution crosses the function boundary (a nested bare write binds an
+ * enclosing `local`), so enclosing function bindings are valid evidence
+ * there. Borrowed AST pointers; truncation frees nothing. */
 typedef struct { char *names[W015_MAX_NAMES]; int n; } W023Scope;
 
 static void w023_scope_push(W023Scope *sc, const char *name) {
     if (!name || sc->n >= W015_MAX_NAMES) return;
     if (name_present(name, sc->names, sc->n)) return;
     sc->names[sc->n++] = (char *)name;   /* borrowed pointer into the AST */
+}
+
+/* Receiver for the compiler's env-bound scan (eigs_scan_env_bound in
+ * compiler.c): pushes each name the compiler binds function-wide in the
+ * scope under review (`catch` error-names and listcomp variables). */
+static void w023_env_bound_cb(const char *name, void *ud) {
+    w023_scope_push((W023Scope *)ud, name);
 }
 
 /* Is `name` `local`-declared by a direct statement of this branch BEFORE
@@ -1440,26 +1460,26 @@ static void w023_check_chain(const W023Branch *br, int nb, const W023Scope *sc,
 
 static void w023_scan(ASTNode *n, LintContext *ctx, int in_func, W023Scope *sc);
 
-/* Walk a statement list in source order, pushing each statement's binders
- * (`local`, list-pattern names, for-var) before scanning it, so a later chain
- * sees exactly the bindings that dominate it. Opens no region of its own:
- * the caller decides where bindings stop being visible via mark/restore. A
- * function-level for-var survives its loop (the runtime scope rules E003
- * pins), so it counts as evidence for what follows the loop too. */
+/* Walk a statement list in source order, pushing each statement's `local`
+ * binder before scanning it, so a later chain sees exactly the bindings that
+ * dominate it. Opens no region of its own: the caller decides where bindings
+ * stop being visible via mark/restore. Only `local` is pushed here — the two
+ * things that LOOK like binders but are not function-local evidence:
+ *  - a bare list-pattern assignment carries no `local_only` flag; its names
+ *    bind outward like any bare `is` (runtime: a later bare write still
+ *    mutates the module binding), and
+ *  - a `for` variable's binding dies with its loop — the runtime tears the
+ *    loop env down at loop exit ("the loop var does not leak", compiler.c),
+ *    so a chain FOLLOWING the loop mutates the outer binding. The AST_FOR
+ *    case pushes the var for its own body region only, where the binding
+ *    does carry a bare write. */
 static void w023_scan_stmts(ASTNode **stmts, int count, LintContext *ctx,
                             int in_func, W023Scope *sc) {
     for (int i = 0; i < count; i++) {
         ASTNode *s = stmts[i];
         if (!s) continue;
-        if (s->type == AST_ASSIGN) {
-            if (s->data.assign.local_only)
-                w023_scope_push(sc, s->data.assign.name);
-        } else if (s->type == AST_LIST_PATTERN_ASSIGN) {
-            for (int k = 0; k < s->data.list_pattern_assign.name_count; k++)
-                w023_scope_push(sc, s->data.list_pattern_assign.names[k]);
-        } else if (s->type == AST_FOR) {
-            w023_scope_push(sc, s->data.forloop.var);
-        }
+        if (s->type == AST_ASSIGN && s->data.assign.local_only)
+            w023_scope_push(sc, s->data.assign.name);
         w023_scan(s, ctx, in_func, sc);
     }
 }
@@ -1473,8 +1493,23 @@ static void w023_scan(ASTNode *n, LintContext *ctx, int in_func, W023Scope *sc) 
             break;
         case AST_FUNC: {
             int mark = sc->n;
+            /* A top-level function starts EMPTY: module-level bindings
+             * (`local`, for-vars, list-pattern names) are the outward
+             * targets this warning exists for — a bare write inside the
+             * function mutates them — never function-local evidence. Nested
+             * functions keep the enclosing stack (outward `is` resolution
+             * crosses the function boundary). */
+            if (!in_func) sc->n = 0;
             for (int p = 0; p < n->data.func.param_count; p++)
                 w023_scope_push(sc, n->data.func.params[p]);
+            /* The env-bound set (`catch` error-names, listcomp variables)
+             * is whole-body and position-independent in the compiler — it is
+             * collected before the body compiles, and forces EVERY write to
+             * those names in this scope onto the current-scope path — so it
+             * is pushed at entry, not where the catch/listcomp happens to
+             * sit. Shared verbatim from compiler.c (eigs_scan_env_bound). */
+            for (int b = 0; b < n->data.func.body_count; b++)
+                eigs_scan_env_bound(n->data.func.body[b], w023_env_bound_cb, sc);
             w023_scan_stmts(n->data.func.body, n->data.func.body_count,
                             ctx, 1, sc);
             sc->n = mark;
@@ -1560,21 +1595,26 @@ static void w023_scan(ASTNode *n, LintContext *ctx, int in_func, W023Scope *sc) 
             break;
         }
         case AST_FOR: {
-            /* The var itself was already pushed by the enclosing statement
-             * walk; only the body's own bindings are scoped to the body. */
+            /* The var is evidence for its own body region only: the runtime
+             * tears the loop binding down at loop exit, so a chain INSIDE
+             * the body binds it while a chain FOLLOWING the loop mutates
+             * outward (both verified against the runtime). */
             int mark = sc->n;
+            w023_scope_push(sc, n->data.forloop.var);
             w023_scan_stmts(n->data.forloop.body, n->data.forloop.body_count,
                             ctx, in_func, sc);
             sc->n = mark;
             break;
         }
         case AST_TRY: {
+            /* err_name is NOT scoped to the catch body here: the compiler
+             * binds it function-wide (it is in the env-bound set pushed at
+             * function entry), so there is nothing to push in this region. */
             int mark = sc->n;
             w023_scan_stmts(n->data.trycatch.try_body,
                             n->data.trycatch.try_count, ctx, in_func, sc);
             sc->n = mark;
             mark = sc->n;
-            w023_scope_push(sc, n->data.trycatch.err_name);
             w023_scan_stmts(n->data.trycatch.catch_body,
                             n->data.trycatch.catch_count, ctx, in_func, sc);
             sc->n = mark;

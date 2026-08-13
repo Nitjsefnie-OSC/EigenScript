@@ -16,7 +16,15 @@ All notable changes to EigenScript are documented here.
   statically decidable: the sibling's `local` is direct evidence the author
   intended a local. W023 flags the bare assignments, function bodies only (at
   module top level both forms bind the same scope), direct branch statements
-  only, with `elif` chains compared as one family of siblings. The dangling
+  only, with `elif` chains compared as one family of siblings. The warning
+  stays silent only when the name already has a function-local binding
+  outside the chain in the compiler's sense of binding — a same-name
+  parameter, an earlier `local`, a function-wide `catch` error-name or
+  listcomp variable (both bind position-independently), an enclosing `for`
+  variable within its own loop body, or an enclosing function's binding for
+  a nested function — and never on account of a module-level binding (the
+  outward target the warning exists for) or a bare list-pattern assignment
+  (which carries no `local` marker). The dangling
   W015 rule comment that handed the general case to the now-closed #396/#404
   now points at #870 as the open tracker.
 

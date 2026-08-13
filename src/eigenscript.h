@@ -1232,6 +1232,17 @@ void eigenscript_set_args(int argc, char **argv);
 const char* val_type_name(ValType t);
 /* #869: interrogative word for an AST_INTERROGATE kind (lint + compiler). */
 const char* eigs_interrogative_word(int kind);
+/* #870: the compiler's env-bound binding set for one scope — `catch`
+ * error-names and listcomp variables, collected whole-scope and
+ * position-independent (compiler.c's scan_for_env_bound). Every write to such
+ * a name in that scope compiles to a current-scope write regardless of
+ * position, so the name is function-local evidence everywhere in the scope.
+ * Defined in compiler.c; declared here so lint's W023 founds its
+ * "function-local binding" test on the compiler's notion instead of
+ * hand-enumerating binders. `cb` receives each collected name (a borrowed
+ * pointer into the AST). */
+typedef void (*eigs_env_bound_cb)(const char *name, void *ud);
+void eigs_scan_env_bound(ASTNode *node, eigs_env_bound_cb cb, void *ud);
 /* #406: the closed error-kind vocabulary. Every built-in runtime error
  * carries exactly one of these; `catch` binds it as the dict's "kind"
  * string (err_kind_name). The set is CLOSED by design — the same

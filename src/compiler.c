@@ -1497,6 +1497,19 @@ static void scan_for_env_bound(ASTNode *node, NameSet *out) {
     }
 }
 
+/* #870: export the env-bound scan for lint's W023, which founds its
+ * "function-local binding" test on this exact notion of binding (a name the
+ * compiler forces onto the current-scope write path function-wide). Sharing
+ * the traversal — rather than lint hand-enumerating binder node types — keeps
+ * the two from drifting; NameSet stays private to this TU, so the names are
+ * handed out through the callback. Pure query: no emission, no state. */
+void eigs_scan_env_bound(ASTNode *node, eigs_env_bound_cb cb, void *ud) {
+    NameSet s = {0};
+    scan_for_env_bound(node, &s);
+    for (int i = 0; i < s.count; i++) cb(s.names[i], ud);
+    name_set_free(&s);
+}
+
 /* Collect module-level names (functions defined, top-level assignments).
  * Stops at function/lambda boundaries — those introduce their own scope.
  * Used to decide whether an assignment inside a function is updating a global

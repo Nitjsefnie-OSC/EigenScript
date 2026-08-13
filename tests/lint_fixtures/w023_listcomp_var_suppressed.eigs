@@ -1,0 +1,10 @@
+t is 5
+define f(flag) as:
+    ys is [t * 2 for t in [1]]
+    if flag == 1:
+        local t is 1
+    else:
+        t is 2
+    return t
+print of ("returned " + (str of (f of 0)))
+print of ("module t is now " + (str of t))

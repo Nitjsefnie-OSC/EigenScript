@@ -680,6 +680,99 @@ OUTPUT=$($EIGS --lint "$TMPFILE" 2>&1 || true)
 check_not_contains "#870 W023 silent at module top level" "$OUTPUT" "W023"
 rm -f "$TMPFILE"
 
+# --- W023 evidence re-founded on the compiler's binding model (#870) ---
+# W023 credits a name with a function-local binding outside the chain only
+# where the COMPILER's binding model carries one: a parameter, a source-order
+# dominating `local`, the function-wide env-bound set (`catch` error-names and
+# listcomp variables — the set compiler.c's scan_for_env_bound computes, which
+# forces every write to the name in that scope onto the current-scope path),
+# or an enclosing `for` variable within its own loop body. Module-level
+# bindings are the outward targets the warning exists for, never evidence.
+# Each fixture asserts the lint verdict AND the runtime fact it rests on
+# (whether the module binding actually changes when the program runs).
+
+# A `catch` error-name binds function-WIDE (the compiler collects it before
+# compiling the body, position-independent), so a chain preceded by a `catch`
+# of the same name never touches the module binding (runtime: module t stays
+# 5) and W023 must stay silent.
+FIXTURE="$TESTS_DIR/lint_fixtures/w023_catch_name_suppressed.eigs"
+OUTPUT=$($EIGS --lint "$FIXTURE" 2>&1 || true)
+check_not_contains "#870 W023 silent when a catch binds the name function-wide" "$OUTPUT" "W023"
+OUTPUT=$($EIGS "$FIXTURE" 2>&1 || true)
+check_contains "#870 runtime: a preceding catch leaves the module binding alone" "$OUTPUT" "module t is now 5"
+
+# The function-wide binding is position-independent: a `catch` AFTER the chain
+# binds it just the same (runtime: module t stays 5).
+FIXTURE="$TESTS_DIR/lint_fixtures/w023_catch_name_after_suppressed.eigs"
+OUTPUT=$($EIGS --lint "$FIXTURE" 2>&1 || true)
+check_not_contains "#870 W023 silent when the catch comes after the chain" "$OUTPUT" "W023"
+OUTPUT=$($EIGS "$FIXTURE" 2>&1 || true)
+check_contains "#870 runtime: a following catch still leaves the module binding alone" "$OUTPUT" "module t is now 5"
+
+# A listcomp variable takes the same function-wide env path as a `catch` name
+# (same compiler scan), so it suppresses too (runtime: module t stays 5).
+FIXTURE="$TESTS_DIR/lint_fixtures/w023_listcomp_var_suppressed.eigs"
+OUTPUT=$($EIGS --lint "$FIXTURE" 2>&1 || true)
+check_not_contains "#870 W023 silent when a listcomp var binds the name function-wide" "$OUTPUT" "W023"
+OUTPUT=$($EIGS "$FIXTURE" 2>&1 || true)
+check_contains "#870 runtime: the listcomp var leaves the module binding alone" "$OUTPUT" "module t is now 5"
+
+# Module-level bindings are OUTER scope from inside a function, never
+# function-local evidence: a module-level `local` must not suppress — the bare
+# write still walks outward (runtime: module t 5 -> 2) and W023 fires.
+FIXTURE="$TESTS_DIR/lint_fixtures/w023_module_local_fires.eigs"
+OUTPUT=$($EIGS --lint "$FIXTURE" 2>&1 || true)
+check_contains "#870 W023 fires despite a module-level local of the same name" "$OUTPUT" "warning\[W023\].*'t'"
+OUTPUT=$($EIGS "$FIXTURE" 2>&1 || true)
+check_contains "#870 runtime: the module-level local is mutated outward" "$OUTPUT" "module t is now 2"
+
+# Same for a module-level `for` variable over a module-bound name: the loop
+# binding is torn down at loop exit, the module binding is what the bare write
+# hits (runtime: module t 5 -> 2) — W023 fires.
+FIXTURE="$TESTS_DIR/lint_fixtures/w023_module_forvar_fires.eigs"
+OUTPUT=$($EIGS --lint "$FIXTURE" 2>&1 || true)
+check_contains "#870 W023 fires despite a module-level for-var of the same name" "$OUTPUT" "warning\[W023\].*'t'"
+OUTPUT=$($EIGS "$FIXTURE" 2>&1 || true)
+check_contains "#870 runtime: the module binding is mutated past the module for-var" "$OUTPUT" "module t is now 2"
+
+# Same for a module-level list-pattern name: no `local` marker exists on that
+# node, the bare write mutates the module binding (runtime: module t 9 -> 2) —
+# W023 fires.
+FIXTURE="$TESTS_DIR/lint_fixtures/w023_module_listpat_fires.eigs"
+OUTPUT=$($EIGS --lint "$FIXTURE" 2>&1 || true)
+check_contains "#870 W023 fires despite a module-level list-pattern name" "$OUTPUT" "warning\[W023\].*'t'"
+OUTPUT=$($EIGS "$FIXTURE" 2>&1 || true)
+check_contains "#870 runtime: the module list-pattern name is mutated outward" "$OUTPUT" "module t is now 2"
+
+# A function-level `for` variable binds only for its body's duration — the
+# runtime tears the binding down at loop exit ("the loop var does not leak",
+# compiler.c) — so it is NOT evidence for a chain that FOLLOWS the loop: the
+# bare write mutates the module binding (runtime: module t 5 -> 2), W023 fires.
+FIXTURE="$TESTS_DIR/lint_fixtures/w023_forvar_loop_scoped.eigs"
+OUTPUT=$($EIGS --lint "$FIXTURE" 2>&1 || true)
+check_contains "#870 W023 fires on a chain following a same-name for loop" "$OUTPUT" "warning\[W023\].*'t'"
+OUTPUT=$($EIGS "$FIXTURE" 2>&1 || true)
+check_contains "#870 runtime: the for-var is gone after the loop, module mutated" "$OUTPUT" "module t is now 2"
+
+# ...but INSIDE the loop body the for-var is the binding the bare write hits
+# (runtime: module t stays 5), so a chain there stays silent. Guard for the
+# region scoping: this held before and must keep holding.
+FIXTURE="$TESTS_DIR/lint_fixtures/w023_forvar_body_suppressed.eigs"
+OUTPUT=$($EIGS --lint "$FIXTURE" 2>&1 || true)
+check_not_contains "#870 W023 silent on a chain inside the for-var's own body" "$OUTPUT" "W023"
+OUTPUT=$($EIGS "$FIXTURE" 2>&1 || true)
+check_contains "#870 runtime: inside the body the write hits the loop binding" "$OUTPUT" "module t is now 5"
+
+# A bare list-pattern assignment carries no `local` marker (the node has no
+# local_only flag), so its names bind outward like any bare `is` — they are
+# not function-local evidence. The chain's bare write still mutates the module
+# binding (runtime: module t 5 -> 2) and W023 fires.
+FIXTURE="$TESTS_DIR/lint_fixtures/w023_listpat_bare_fires.eigs"
+OUTPUT=$($EIGS --lint "$FIXTURE" 2>&1 || true)
+check_contains "#870 W023 fires despite a preceding bare list-pattern assignment" "$OUTPUT" "warning\[W023\].*'t'"
+OUTPUT=$($EIGS "$FIXTURE" 2>&1 || true)
+check_contains "#870 runtime: a bare list-pattern name is no local binding" "$OUTPUT" "module t is now 2"
+
 # --- #399: --lint-level threshold ---
 TMPFILE=$(mktemp /tmp/lint_test_XXXXXX.eigs)
 printf 'temp is 42\nprint of "hi"\n' > "$TMPFILE"   # W001 unused variable
