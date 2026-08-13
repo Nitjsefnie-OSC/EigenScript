@@ -1387,8 +1387,9 @@ static ASTNode* parse_statement_inner(Parser *p);
 static ASTNode* parse_statement(Parser *p) {
     /* Release any chain-charged depth (chain_too_deep) accumulated while
      * parsing this statement, so the bound is per-statement, not cumulative
-     * across a whole function body. Nesting depth is preserved by parse_block's
-     * own guard. */
+     * across a whole function body. Flat constructs that recurse in C without
+     * a nested block — operator chains, and the elif desugaring recursion
+     * (#926) — charge the counter at their own sites via chain_too_deep. */
     int saved_depth = g_parse_depth;
     ASTNode *r = parse_statement_inner(p);
     g_parse_depth = saved_depth;
@@ -1610,11 +1611,21 @@ static ASTNode* parse_statement_inner(Parser *p) {
         int else_count = 0;
         p_skip_newlines(p);
         if (p_cur(p)->type == TOK_ELIF) {
-            /* Treat elif as: else { if ... } — rewrite token and recurse */
+            /* Treat elif as: else { if ... } — rewrite token and recurse.
+             * The chain is syntactically FLAT but recurses in C once per
+             * arm, so it must charge the shared parse-depth counter itself
+             * (#926) — the same shape chain_too_deep covers for the
+             * iterative operator chains. On too-deep the error is recorded
+             * and the chain terminates here — else_body stays NULL rather
+             * than descending — so the C recursion bottoms out instead of
+             * exhausting the stack. No matching decrement: parse_statement's
+             * save/restore releases the charge when this statement ends. */
             p_cur(p)->type = TOK_IF;
-            else_body = xmalloc(sizeof(ASTNode*));
-            else_body[0] = parse_statement(p);
-            else_count = 1;
+            if (!chain_too_deep(p)) {
+                else_body = xmalloc(sizeof(ASTNode*));
+                else_body[0] = parse_statement(p);
+                else_count = 1;
+            }
         } else if (p_cur(p)->type == TOK_ELSE) {
             p_advance(p);
             p_expect(p, TOK_COLON);

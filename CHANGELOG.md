@@ -4,6 +4,21 @@ All notable changes to EigenScript are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A long `elif` chain no longer exhausts the C stack in the parser
+  (#926).** Each `elif` arm desugars to a nested `if` by recursing in
+  `parse_statement`, and that recursion never charged the shared
+  parse-depth counter — so past roughly 12,800 arms the parser SIGSEGVed
+  before the compiler's depth limit could reject the program, and `--lint`
+  (which never runs the compiler) had no depth protection on this path at
+  any length. The recursion site now charges `g_parse_depth` via
+  `chain_too_deep`, the same mechanism the flat operator chains already
+  use, and stops recursing when the shared 256 bound is reached. A chain
+  past the bound gets a clean parse diagnostic and a non-zero exit in both
+  plain and `--lint` mode; below it behaviour is unchanged — a 200-arm
+  chain still parses and is still refused by the compiler's own 128 limit.
+
 ## [0.39.0] - 2026-08-10
 
 ### Fixed
