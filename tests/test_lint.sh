@@ -619,6 +619,34 @@ FIXTURE="$TESTS_DIR/lint_fixtures/w023_neither_local.eigs"
 OUTPUT=$($EIGS --lint "$FIXTURE" 2>&1 || true)
 check_not_contains "#870 W023 silent when no branch declares local (benign reuse)" "$OUTPUT" "W023"
 
+# A same-name function PARAMETER is itself the local binding the bare write
+# hits (runtime: module t stays 5), so the sibling `local` is not evidence of
+# an outward mutation — W023 must stay silent.
+FIXTURE="$TESTS_DIR/lint_fixtures/w023_param_suppressed.eigs"
+OUTPUT=$($EIGS --lint "$FIXTURE" 2>&1 || true)
+check_not_contains "#870 W023 silent when the name is a function parameter" "$OUTPUT" "W023"
+
+# A `local` declared earlier in the function body (outside the chain) is the
+# binding the bare write hits (runtime: module t stays 5) — W023 must stay
+# silent there too.
+FIXTURE="$TESTS_DIR/lint_fixtures/w023_local_before_suppressed.eigs"
+OUTPUT=$($EIGS --lint "$FIXTURE" 2>&1 || true)
+check_not_contains "#870 W023 silent when a body-level local precedes the chain" "$OUTPUT" "W023"
+
+# Regression guard against over-suppressing: with NO binding outside the
+# chain, the sibling-local/bare-write shape still mutates the module binding
+# (runtime: module t becomes 2) and W023 still fires.
+FIXTURE="$TESTS_DIR/lint_fixtures/w023_true_positive.eigs"
+OUTPUT=$($EIGS --lint "$FIXTURE" 2>&1 || true)
+check_contains "#870 W023 still fires with no binding outside the chain" "$OUTPUT" "warning\[W023\].*'t'"
+
+# A same-branch `local` binds only FROM ITS LINE ONWARD: a bare assignment
+# earlier in the same branch still mutates the module binding (runtime:
+# module t becomes 1), so W023 fires on it.
+FIXTURE="$TESTS_DIR/lint_fixtures/w023_bare_before_local.eigs"
+OUTPUT=$($EIGS --lint "$FIXTURE" 2>&1 || true)
+check_contains "#870 W023 fires on a bare assignment before the same-branch local" "$OUTPUT" "warning\[W023\].*'t'"
+
 # elif chains are one chain of siblings (`elif` parses as else{if}); a bare
 # assignment on any sibling of the `local`-declaring branch fires.
 TMPFILE=$(mktemp /tmp/lint_test_XXXXXX.eigs)

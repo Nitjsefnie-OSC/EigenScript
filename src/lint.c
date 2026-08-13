@@ -1344,6 +1344,15 @@ static void check_outer_mutation(ASTNode *ast, LintContext *ctx) {
  *   chain-continuation nodes are consumed by the flattening rather than
  *   re-scanned as chain heads — an if/elif/else never double-fires against
  *   its own tail.
+ * - A name with a function-local binding OUTSIDE the chain is exempt: a bare
+ *   `is` binds the innermost existing outward binding, so when a parameter or
+ *   an already-established `local` carries the name, the bare write binds
+ *   THAT, not an outer scope, and the sibling `local` has a benign reading.
+ *   The evidence is threaded in source order so only bindings that dominate
+ *   the chain count — deliberately NOT a whole-function local sweep, which
+ *   would swallow the in-chain `local` that makes the true positive
+ *   detectable. (W015's comment: under-collecting evidence is the cardinal
+ *   sin; over-collecting at worst silences a warning.)
  * - No overlap with W015 by construction: W015 stays silent on any name that
  *   is `local`-declared anywhere in the same function body, and W023 fires
  *   only on names that are. */
@@ -1352,9 +1361,35 @@ static void check_outer_mutation(ASTNode *ast, LintContext *ctx) {
 
 typedef struct { ASTNode **stmts; int count; } W023Branch;
 
-/* Is `name` `local`-declared by a direct statement of this branch? */
-static int w023_branch_has_local(const W023Branch *b, const char *name) {
-    for (int i = 0; i < b->count; i++) {
+/* Function-local bindings established OUTSIDE the chain under review. A bare
+ * `x is ...` binds the innermost existing outward binding, so when one of
+ * these names is in scope the sibling-`local` evidence has a benign reading
+ * and warning would be a false positive (a same-name parameter, or a `local`
+ * declared earlier in the same body — both verified against the runtime,
+ * which leaves the module binding untouched). One stack per file, threaded
+ * with mark/restore so a binding is visible only where it dominates: params
+ * are pushed on function entry, body statements are walked in source order
+ * pushing their binders, and each exclusive or maybe-never-executed body
+ * (chain branch, loop body, try/catch, match arm) walks in a fresh region so
+ * its bindings leak neither sideways nor backwards. Nested functions inherit
+ * the enclosing stack: outward `is` resolution crosses the function boundary
+ * (a nested bare write binds an enclosing `local`), so enclosing locals are
+ * valid evidence there. Borrowed AST pointers; truncation frees nothing. */
+typedef struct { char *names[W015_MAX_NAMES]; int n; } W023Scope;
+
+static void w023_scope_push(W023Scope *sc, const char *name) {
+    if (!name || sc->n >= W015_MAX_NAMES) return;
+    if (name_present(name, sc->names, sc->n)) return;
+    sc->names[sc->n++] = (char *)name;   /* borrowed pointer into the AST */
+}
+
+/* Is `name` `local`-declared by a direct statement of this branch BEFORE
+ * statement index `before`? A same-branch `local` binds only from its own
+ * line onward, so a bare assignment earlier in the same branch still mutates
+ * an outer binding. */
+static int w023_branch_has_local_before(const W023Branch *b, const char *name,
+                                        int before) {
+    for (int i = 0; i < before && i < b->count; i++) {
         ASTNode *s = b->stmts[i];
         if (s && s->type == AST_ASSIGN && s->data.assign.local_only &&
             s->data.assign.name && strcmp(s->data.assign.name, name) == 0)
@@ -1363,7 +1398,8 @@ static int w023_branch_has_local(const W023Branch *b, const char *name) {
     return 0;
 }
 
-static void w023_check_chain(const W023Branch *br, int nb, LintContext *ctx) {
+static void w023_check_chain(const W023Branch *br, int nb, const W023Scope *sc,
+                             LintContext *ctx) {
     /* Union of `local`-declared names across all sibling branches, sized by
      * the total statement count so it cannot overflow. */
     int total = 0;
@@ -1380,8 +1416,11 @@ static void w023_check_chain(const W023Branch *br, int nb, LintContext *ctx) {
                 locals[locals_n++] = st->data.assign.name; /* borrowed; not freed */
         }
     /* Flag each bare direct-statement assignment whose name is `local`-
-     * declared on a DIFFERENT branch of the chain. A branch that declares the
-     * local itself is fine (it binds from that line onward). */
+     * declared on a DIFFERENT branch of the chain, unless a function-local
+     * binding for it already exists outside the chain (the bare write then
+     * binds that, not an outer scope). A branch that declares the local
+     * itself earlier is fine (it binds from that line onward); a bare
+     * assignment BEFORE the branch's own `local` still mutates outward. */
     for (int i = 0; i < nb; i++)
         for (int s = 0; s < br[i].count; s++) {
             ASTNode *st = br[i].stmts[s];
@@ -1389,7 +1428,8 @@ static void w023_check_chain(const W023Branch *br, int nb, LintContext *ctx) {
                 !st->data.assign.name) continue;
             const char *name = st->data.assign.name;
             if (!name_present(name, locals, locals_n)) continue;
-            if (w023_branch_has_local(&br[i], name)) continue;
+            if (name_present(name, sc->names, sc->n)) continue;
+            if (w023_branch_has_local_before(&br[i], name, s)) continue;
             lint_warn(ctx, st->line, "W023",
                 "'%s' is 'local'-declared on a sibling branch of this "
                 "if/elif/else; assigned bare here it mutates an outer binding — "
@@ -1398,83 +1438,162 @@ static void w023_check_chain(const W023Branch *br, int nb, LintContext *ctx) {
     free(locals);
 }
 
-static void w023_scan(ASTNode *n, LintContext *ctx, int in_func) {
+static void w023_scan(ASTNode *n, LintContext *ctx, int in_func, W023Scope *sc);
+
+/* Walk a statement list in source order, pushing each statement's binders
+ * (`local`, list-pattern names, for-var) before scanning it, so a later chain
+ * sees exactly the bindings that dominate it. Opens no region of its own:
+ * the caller decides where bindings stop being visible via mark/restore. A
+ * function-level for-var survives its loop (the runtime scope rules E003
+ * pins), so it counts as evidence for what follows the loop too. */
+static void w023_scan_stmts(ASTNode **stmts, int count, LintContext *ctx,
+                            int in_func, W023Scope *sc) {
+    for (int i = 0; i < count; i++) {
+        ASTNode *s = stmts[i];
+        if (!s) continue;
+        if (s->type == AST_ASSIGN) {
+            if (s->data.assign.local_only)
+                w023_scope_push(sc, s->data.assign.name);
+        } else if (s->type == AST_LIST_PATTERN_ASSIGN) {
+            for (int k = 0; k < s->data.list_pattern_assign.name_count; k++)
+                w023_scope_push(sc, s->data.list_pattern_assign.names[k]);
+        } else if (s->type == AST_FOR) {
+            w023_scope_push(sc, s->data.forloop.var);
+        }
+        w023_scan(s, ctx, in_func, sc);
+    }
+}
+
+static void w023_scan(ASTNode *n, LintContext *ctx, int in_func, W023Scope *sc) {
     if (!n) return;
     switch (n->type) {
         case AST_PROGRAM:
-            for (int i = 0; i < n->data.program.count; i++)
-                w023_scan(n->data.program.stmts[i], ctx, 0);
+            w023_scan_stmts(n->data.program.stmts, n->data.program.count,
+                            ctx, 0, sc);
             break;
-        case AST_FUNC:
-            for (int i = 0; i < n->data.func.body_count; i++)
-                w023_scan(n->data.func.body[i], ctx, 1);
-            break;
-        case AST_LAMBDA:
-            w023_scan(n->data.lambda.body, ctx, 1);
-            break;
-        case AST_IF: {
-            W023Branch br[W023_MAX_BRANCHES];
-            int nb = 0, overflow = 0;
-            ASTNode *chain = n;
-            while (chain) {
-                if (nb >= W023_MAX_BRANCHES) { overflow = 1; break; }
-                br[nb].stmts = chain->data.cond.if_body;
-                br[nb].count = chain->data.cond.if_count;
-                nb++;
-                if (chain->data.cond.else_count == 1 &&
-                    chain->data.cond.else_body[0] &&
-                    chain->data.cond.else_body[0]->type == AST_IF) {
-                    chain = chain->data.cond.else_body[0];   /* elif */
-                } else {
-                    if (chain->data.cond.else_count > 0) {
-                        if (nb >= W023_MAX_BRANCHES) { overflow = 1; break; }
-                        br[nb].stmts = chain->data.cond.else_body;
-                        br[nb].count = chain->data.cond.else_count;
-                        nb++;
-                    }
-                    chain = NULL;
-                }
-            }
-            if (overflow) {
-                /* Chain longer than the cap: skip the chain check (never
-                 * invent a warning) and recurse naively — the unconsumed elif
-                 * continuation becomes a fresh, smaller chain head, which
-                 * cannot double-fire because this chain never fired. */
-                for (int i = 0; i < n->data.cond.if_count; i++)
-                    w023_scan(n->data.cond.if_body[i], ctx, in_func);
-                for (int i = 0; i < n->data.cond.else_count; i++)
-                    w023_scan(n->data.cond.else_body[i], ctx, in_func);
-                break;
-            }
-            if (in_func) w023_check_chain(br, nb, ctx);
-            for (int i = 0; i < nb; i++)
-                for (int s = 0; s < br[i].count; s++)
-                    w023_scan(br[i].stmts[s], ctx, in_func);
+        case AST_FUNC: {
+            int mark = sc->n;
+            for (int p = 0; p < n->data.func.param_count; p++)
+                w023_scope_push(sc, n->data.func.params[p]);
+            w023_scan_stmts(n->data.func.body, n->data.func.body_count,
+                            ctx, 1, sc);
+            sc->n = mark;
             break;
         }
-        case AST_LOOP:
-            for (int i = 0; i < n->data.loop.body_count; i++)
-                w023_scan(n->data.loop.body[i], ctx, in_func);
+        case AST_LAMBDA: {
+            int mark = sc->n;
+            for (int p = 0; p < n->data.lambda.param_count; p++)
+                w023_scope_push(sc, n->data.lambda.params[p]);
+            w023_scan(n->data.lambda.body, ctx, 1, sc);
+            sc->n = mark;
             break;
-        case AST_FOR:
-            for (int i = 0; i < n->data.forloop.body_count; i++)
-                w023_scan(n->data.forloop.body[i], ctx, in_func);
+        }
+        case AST_IF: {
+            /* Heap-allocated, and the chain head iterated rather than
+             * recursed: a 1 KB per-frame branch array multiplied by
+             * per-elif recursion roughly halved the chain length the linter
+             * survived. An elif chain now costs this check O(1) stack
+             * regardless of length. */
+            W023Branch *br = xcalloc(W023_MAX_BRANCHES, sizeof(W023Branch));
+            ASTNode *head = n;
+            while (head) {
+                int nb = 0, overflow = 0;
+                ASTNode *chain = head;
+                while (chain) {
+                    if (nb >= W023_MAX_BRANCHES) { overflow = 1; break; }
+                    br[nb].stmts = chain->data.cond.if_body;
+                    br[nb].count = chain->data.cond.if_count;
+                    nb++;
+                    if (chain->data.cond.else_count == 1 &&
+                        chain->data.cond.else_body[0] &&
+                        chain->data.cond.else_body[0]->type == AST_IF) {
+                        chain = chain->data.cond.else_body[0];   /* elif */
+                    } else {
+                        if (chain->data.cond.else_count > 0) {
+                            if (nb >= W023_MAX_BRANCHES) { overflow = 1; break; }
+                            br[nb].stmts = chain->data.cond.else_body;
+                            br[nb].count = chain->data.cond.else_count;
+                            nb++;
+                        }
+                        chain = NULL;
+                    }
+                }
+                if (overflow) {
+                    /* Chain longer than the cap: skip the chain check (never
+                     * invent a warning) and walk the bodies naively — the
+                     * unconsumed elif continuation becomes a fresh, smaller
+                     * chain head (iterated, not recursed), which cannot
+                     * double-fire because this chain never fired. */
+                    int mark = sc->n;
+                    w023_scan_stmts(head->data.cond.if_body,
+                                    head->data.cond.if_count, ctx, in_func, sc);
+                    sc->n = mark;
+                    if (head->data.cond.else_count == 1 &&
+                        head->data.cond.else_body[0] &&
+                        head->data.cond.else_body[0]->type == AST_IF) {
+                        head = head->data.cond.else_body[0];   /* elif */
+                        continue;
+                    }
+                    mark = sc->n;
+                    w023_scan_stmts(head->data.cond.else_body,
+                                    head->data.cond.else_count, ctx, in_func, sc);
+                    sc->n = mark;
+                    head = NULL;
+                    continue;
+                }
+                if (in_func) w023_check_chain(br, nb, sc, ctx);
+                for (int i = 0; i < nb; i++) {
+                    int mark = sc->n;
+                    w023_scan_stmts(br[i].stmts, br[i].count, ctx, in_func, sc);
+                    sc->n = mark;
+                }
+                head = NULL;
+            }
+            free(br);
             break;
-        case AST_TRY:
-            for (int i = 0; i < n->data.trycatch.try_count; i++)
-                w023_scan(n->data.trycatch.try_body[i], ctx, in_func);
-            for (int i = 0; i < n->data.trycatch.catch_count; i++)
-                w023_scan(n->data.trycatch.catch_body[i], ctx, in_func);
+        }
+        case AST_LOOP: {
+            int mark = sc->n;
+            w023_scan_stmts(n->data.loop.body, n->data.loop.body_count,
+                            ctx, in_func, sc);
+            sc->n = mark;
             break;
+        }
+        case AST_FOR: {
+            /* The var itself was already pushed by the enclosing statement
+             * walk; only the body's own bindings are scoped to the body. */
+            int mark = sc->n;
+            w023_scan_stmts(n->data.forloop.body, n->data.forloop.body_count,
+                            ctx, in_func, sc);
+            sc->n = mark;
+            break;
+        }
+        case AST_TRY: {
+            int mark = sc->n;
+            w023_scan_stmts(n->data.trycatch.try_body,
+                            n->data.trycatch.try_count, ctx, in_func, sc);
+            sc->n = mark;
+            mark = sc->n;
+            w023_scope_push(sc, n->data.trycatch.err_name);
+            w023_scan_stmts(n->data.trycatch.catch_body,
+                            n->data.trycatch.catch_count, ctx, in_func, sc);
+            sc->n = mark;
+            break;
+        }
         case AST_BLOCK:
         case AST_UNOBSERVED:
-            for (int i = 0; i < n->data.block.count; i++)
-                w023_scan(n->data.block.stmts[i], ctx, in_func);
+            /* A grouping, not an execution boundary: its statements run
+             * straight-line, so their binders dominate what follows. */
+            w023_scan_stmts(n->data.block.stmts, n->data.block.count,
+                            ctx, in_func, sc);
             break;
         case AST_MATCH:
-            for (int c = 0; c < n->data.match.case_count; c++)
-                for (int k = 0; k < n->data.match.body_counts[c]; k++)
-                    w023_scan(n->data.match.bodies[c][k], ctx, in_func);
+            for (int c = 0; c < n->data.match.case_count; c++) {
+                int mark = sc->n;
+                w023_scan_stmts(n->data.match.bodies[c],
+                                n->data.match.body_counts[c], ctx, in_func, sc);
+                sc->n = mark;
+            }
             break;
         /* Nothing to do for these. Enumerated rather than covered by a
          * `default:` so that -Werror=switch (Makefile CFLAGS) makes a new
@@ -1507,7 +1626,9 @@ static void w023_scan(ASTNode *n, LintContext *ctx, int in_func) {
 }
 
 static void check_sibling_branch_local(ASTNode *ast, LintContext *ctx) {
-    w023_scan(ast, ctx, 0);
+    W023Scope *sc = xcalloc(1, sizeof(W023Scope));
+    w023_scan(ast, ctx, 0, sc);
+    free(sc);
 }
 
 /* ---- W016: bare trajectory predicate outside a loop condition ---- */
