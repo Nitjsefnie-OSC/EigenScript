@@ -12,12 +12,17 @@ All notable changes to EigenScript are documented here.
   parse-depth counter — so past roughly 12,800 arms the parser SIGSEGVed
   before the compiler's depth limit could reject the program, and `--lint`
   (which never runs the compiler) had no depth protection on this path at
-  any length. The recursion site now charges `g_parse_depth` via
-  `chain_too_deep`, the same mechanism the flat operator chains already
-  use, and stops recursing when the shared 256 bound is reached. A chain
-  past the bound gets a clean parse diagnostic and a non-zero exit in both
-  plain and `--lint` mode; below it behaviour is unchanged — a 200-arm
-  chain still parses and is still refused by the compiler's own 128 limit.
+  any length. The recursion site now charges `g_parse_depth` before
+  descending into the next arm and tests the shared 256 bound against the
+  post-charge depth — the depth that arm actually parses at — so the
+  statement-level bound, not error recovery, is what terminates the chain:
+  the error is recorded, the unread tail is drained without further
+  diagnostics, and the recursion stops with `else_body` NULL. A chain past
+  the bound gets a small, bounded set of parse diagnostics and a non-zero
+  exit in both plain and `--lint` mode — the same set whether the chain
+  has 258 arms or 14,000. Below the bound behaviour is unchanged — a
+  200-arm chain still parses and is still refused by the compiler's own
+  128 limit.
 
 ## [0.39.0] - 2026-08-10
 

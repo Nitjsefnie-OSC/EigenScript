@@ -44,19 +44,27 @@ check_no_crash "logical 'and' chain bomb"  "x is 1$(printf ' and 1%.0s' $(seq 1 
 # ~12,800 arms the parser exhausted the C stack (SIGSEGV rc 139) before the
 # compiler's depth limit could reject the program, and --lint (which never
 # runs the compiler) had no depth protection on this path at any length. The
-# recursion site now charges g_parse_depth via chain_too_deep, the mechanism
-# the tree already uses for flat-but-C-recursive constructs. Consequences
-# pinned here:
-#   * below the bound behaviour is byte-identical — a 200-arm chain still
-#     parses and is still refused by the COMPILER's own 128 limit (plain),
-#     and --lint still exits 0;
-#   * the bound fires at the 252nd elif on this chain shape — the shared
-#     counter also carries the block/expression charges live at the deepest
-#     point of the descent, so it crosses 256 a few arms before the 257th
-#     elif — giving a clean PARSE diagnostic and a non-zero exit in BOTH
-#     modes (previously the compile error up to ~12,800 arms, SIGSEGV
-#     beyond);
-#   * 14,000 arms no longer crashes, in both modes;
+# recursion site now charges g_parse_depth BEFORE descending into the next
+# arm and tests the bound against the post-charge depth — the depth that
+# arm's condition expression actually parses at. (Testing pre-charge, the
+# chain_too_deep order, is dead code at this site: parse_expression's own
+# guard on the same counter trips one level earlier — measured zero fires
+# at 14,000 arms — so error recovery, not the bound, ended the chain.)
+# Consequences pinned here:
+#   * well below the bound behaviour is byte-identical — a 200-arm chain
+#     still parses and is still refused by the COMPILER's own 128 limit
+#     (plain), and --lint still exits 0;
+#   * approaching the bound (253–256 arms on this shape) the first things
+#     to cross 256 are the arms' own expressions: each arm parses at the
+#     depth charged for it, so `print of N` (and `-1` in the else) descends
+#     a few levels deeper transiently and trips the EXPRESSION-level guard
+#     — a few parse diagnostics, not a cascade;
+#   * at the 257th arm the elif-site bound itself fires (post-charge depth
+#     reaches 256): the error is recorded, the unread tail of the chain is
+#     drained without further diagnostics, and the chain terminates — so a
+#     258-arm chain and a 14,000-arm chain print the SAME small set of
+#     errors, instead of ~41,000 cascade lines (and, past ~12,800 arms at
+#     base, instead of SIGSEGV);
 #   * the charge is released when the statement ends (parse_statement's
 #     save/restore), so a chain leaks no depth into what follows it.
 
@@ -98,10 +106,11 @@ check_rc_out "200-arm chain: plain run still hits the COMPILE depth limit" 1 \
 OUT=$("$BIN" --lint "$ELIF_TMP/c200.eigs" 2>&1); RC=$?
 check_rc_out "200-arm chain: --lint still exits 0" 0 "no issues found" "$RC" "$OUT"
 
-# Boundary (measured on this exact chain shape): 251 elifs still parse —
-# the shared counter also carries the block/expression charges live at the
-# deepest point of the descent, so it crosses 256 a few arms before the
-# 257th elif — and 252 elifs is where the bound first fires.
+# Approaching the bound (this exact chain shape): 252 arms still parse
+# cleanly — the deepest transient descent (the else block's `print of -1`,
+# four levels below its arm's charged depth) reaches 255. At 253 arms that
+# descent crosses 256 and the EXPRESSION-level guard fires — a parse error
+# in both modes, from the expression guard rather than the elif bound.
 gen_elif_chain 252 "$ELIF_TMP/c252.eigs"
 OUT=$("$BIN" "$ELIF_TMP/c252.eigs" 2>&1); RC=$?
 check_rc_out "251-elif chain: plain run still hits the COMPILE depth limit" 1 \
@@ -116,8 +125,10 @@ OUT=$("$BIN" --lint "$ELIF_TMP/c253.eigs" 2>&1); RC=$?
 check_rc_out "252-elif chain: --lint is a PARSE error" 1 \
     "parse error(s) [E002]" "$RC" "$OUT"
 
-# 257 elifs: the parse bound fires. Clean PARSE diagnostic, non-zero exit,
-# in BOTH modes — replacing the compile error (and, longer, the SIGSEGV).
+# 257 elifs (258 arms): the elif-site bound fires refusing the 257th arm —
+# the unread tail is drained and the chain terminates with a small, bounded
+# set of parse diagnostics in BOTH modes, no longer reaching the compiler
+# (and, past ~12,800 arms, no longer crashing).
 gen_elif_chain 258 "$ELIF_TMP/c258.eigs"
 OUT=$("$BIN" "$ELIF_TMP/c258.eigs" 2>&1); RC=$?
 check_rc_out "257-elif chain: plain run is a PARSE error" 1 \

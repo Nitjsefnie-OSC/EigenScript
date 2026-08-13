@@ -230,6 +230,36 @@ static void p_skip_newlines(Parser *p) {
     while (p_cur(p)->type == TOK_NEWLINE) p_advance(p);
 }
 
+/* Drain the unread tail of an elif chain after the depth bound refuses it
+ * (#926). The tail's tokens are still in the stream; if they reached the
+ * enclosing statement loop, every remaining arm would be re-read as garbage
+ * (thousands of cascade errors on a long chain). Each remaining
+ * `elif <cond>:` arm — and a trailing `else:` — is skipped at the TOKEN
+ * level only: no expression or statement parsing, so no further
+ * diagnostics. The cursor is left on the first token after the chain. Body
+ * blocks are skipped INDENT/DEDENT-balanced, so a nested block inside an
+ * arm is consumed whole; a condition cannot contain a NEWLINE token (the
+ * lexer suppresses them inside brackets). */
+static void p_skip_elif_tail(Parser *p) {
+    for (;;) {
+        TokType t = p_cur(p)->type;
+        if (t != TOK_ELIF && t != TOK_ELSE) return;
+        p_advance(p);
+        while (p_cur(p)->type != TOK_NEWLINE && p_cur(p)->type != TOK_EOF)
+            p_advance(p);   /* condition + colon */
+        p_skip_newlines(p);
+        if (p_cur(p)->type == TOK_INDENT) {
+            int level = 0;
+            do {
+                if (p_cur(p)->type == TOK_INDENT) level++;
+                else if (p_cur(p)->type == TOK_DEDENT) level--;
+                p_advance(p);
+            } while (level > 0 && p_cur(p)->type != TOK_EOF);
+        }
+        if (t == TOK_ELSE) return;
+    }
+}
+
 ASTNode* make_node_col(ASTType type, int line, int col) {
     ASTNode *n = xcalloc(1, sizeof(ASTNode));
     n->type = type;
@@ -1385,11 +1415,12 @@ static ASTNode* parse_expression(Parser *p) {
 static ASTNode* parse_statement_inner(Parser *p);
 
 static ASTNode* parse_statement(Parser *p) {
-    /* Release any chain-charged depth (chain_too_deep) accumulated while
-     * parsing this statement, so the bound is per-statement, not cumulative
-     * across a whole function body. Flat constructs that recurse in C without
-     * a nested block — operator chains, and the elif desugaring recursion
-     * (#926) — charge the counter at their own sites via chain_too_deep. */
+    /* Release any chain-charged depth accumulated while parsing this
+     * statement, so the bound is per-statement, not cumulative across a
+     * whole function body. Flat constructs that recurse in C without a
+     * nested block — operator chains (via chain_too_deep), and the elif
+     * desugaring recursion (#926, charged at the recursion site) — charge
+     * the counter at their own sites. */
     int saved_depth = g_parse_depth;
     ASTNode *r = parse_statement_inner(p);
     g_parse_depth = saved_depth;
@@ -1615,13 +1646,28 @@ static ASTNode* parse_statement_inner(Parser *p) {
              * The chain is syntactically FLAT but recurses in C once per
              * arm, so it must charge the shared parse-depth counter itself
              * (#926) — the same shape chain_too_deep covers for the
-             * iterative operator chains. On too-deep the error is recorded
+             * iterative operator chains. The charge lands BEFORE the
+             * descent into the next arm, and the bound is tested against
+             * the post-charge depth — the depth the next arm's condition
+             * expression actually parses at. Testing pre-charge (the
+             * chain_too_deep order) lets the recursion reach exactly the
+             * depth where parse_expression's own guard on the same counter
+             * trips one level earlier, making this branch unreachable
+             * (measured: zero fires at 14,000 arms) and leaving error
+             * recovery to terminate the chain instead. On too-deep the
+             * error is recorded, the unread tail of the chain is drained,
              * and the chain terminates here — else_body stays NULL rather
              * than descending — so the C recursion bottoms out instead of
              * exhausting the stack. No matching decrement: parse_statement's
              * save/restore releases the charge when this statement ends. */
-            p_cur(p)->type = TOK_IF;
-            if (!chain_too_deep(p)) {
+            g_parse_depth++;
+            if (g_parse_depth >= PARSE_MAX_DEPTH) {
+                eigs_record_first_error(p_cur(p)->line,
+                                        "expression too deeply nested");
+                g_parse_errors++;
+                p_skip_elif_tail(p);
+            } else {
+                p_cur(p)->type = TOK_IF;
                 else_body = xmalloc(sizeof(ASTNode*));
                 else_body[0] = parse_statement(p);
                 else_count = 1;
