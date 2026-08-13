@@ -602,6 +602,56 @@ check_contains "ambiguous loop still W014" "$OUTPUT" "W014"
 check_not_contains "no W016 double-fire on loop condition" "$OUTPUT" "W016"
 rm -f "$TMPFILE"
 
+# --- W023 (#870): bare sibling-branch assignment to a `local`-declared name ---
+# A name `local`-declared on one branch of an if/elif/else and bare-assigned on
+# a sibling branch: the `local` is direct evidence of intent, so the bare write
+# (which mutates outward) is statically decidable — no dataflow needed.
+FIXTURE="$TESTS_DIR/lint_fixtures/w023_sibling_bare.eigs"
+OUTPUT=$($EIGS --lint "$FIXTURE" 2>&1 || true)
+check_contains "#870 W023 fires on the issue's sibling-branch repro" "$OUTPUT" "warning\[W023\].*'t'"
+check_not_contains "#870 no W015 double-fire on the sibling-local shape" "$OUTPUT" "W015"
+
+FIXTURE="$TESTS_DIR/lint_fixtures/w023_both_local.eigs"
+OUTPUT=$($EIGS --lint "$FIXTURE" 2>&1 || true)
+check_not_contains "#870 W023 silent when every sibling branch declares local" "$OUTPUT" "W023"
+
+FIXTURE="$TESTS_DIR/lint_fixtures/w023_neither_local.eigs"
+OUTPUT=$($EIGS --lint "$FIXTURE" 2>&1 || true)
+check_not_contains "#870 W023 silent when no branch declares local (benign reuse)" "$OUTPUT" "W023"
+
+# elif chains are one chain of siblings (`elif` parses as else{if}); a bare
+# assignment on any sibling of the `local`-declaring branch fires.
+TMPFILE=$(mktemp /tmp/lint_test_XXXXXX.eigs)
+cat > "$TMPFILE" << 'EIGS'
+define f(flag) as:
+    if flag == 1:
+        local t is 1
+    elif flag == 2:
+        t is 2
+    else:
+        t is 3
+    return t
+print of (str of (f of 0))
+EIGS
+OUTPUT=$($EIGS --lint "$TMPFILE" 2>&1 || true)
+check_contains "#870 W023 fires across an if/elif/else chain" "$OUTPUT" "warning\[W023\].*'t'"
+rm -f "$TMPFILE"
+
+# Module top level: `local` and a bare `is` bind the same module scope there
+# (no outward-write hazard), so the check stays silent outside functions.
+TMPFILE=$(mktemp /tmp/lint_test_XXXXXX.eigs)
+cat > "$TMPFILE" << 'EIGS'
+flag is 0
+if flag == 1:
+    local t is 1
+else:
+    t is 2
+print of t
+EIGS
+OUTPUT=$($EIGS --lint "$TMPFILE" 2>&1 || true)
+check_not_contains "#870 W023 silent at module top level" "$OUTPUT" "W023"
+rm -f "$TMPFILE"
+
 # --- #399: --lint-level threshold ---
 TMPFILE=$(mktemp /tmp/lint_test_XXXXXX.eigs)
 printf 'temp is 42\nprint of "hi"\n' > "$TMPFILE"   # W001 unused variable

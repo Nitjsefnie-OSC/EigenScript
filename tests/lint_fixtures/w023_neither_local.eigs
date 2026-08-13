@@ -1,0 +1,7 @@
+define f(flag) as:
+    if flag == 1:
+        t is 1
+    else:
+        t is 2
+    return t
+print of (str of (f of 0))

@@ -4,6 +4,22 @@ All notable changes to EigenScript are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- **Lint `W023`: bare sibling-branch assignment to a `local`-declared name
+  (#870).** `llms.txt` documents that each sibling `if`/`elif`/`else` branch
+  needs its own `local` for a first assignment, and a script that wrote
+  `local t is 1` on one branch and a bare `t is 2` on the sibling linted
+  completely clean while the bare write mutated an outer binding. The general
+  outer-mutation case needs dataflow to tell benign reuse from a real clobber
+  (why W015 stays scoped to function-name clobbering), but this shape is
+  statically decidable: the sibling's `local` is direct evidence the author
+  intended a local. W023 flags the bare assignments, function bodies only (at
+  module top level both forms bind the same scope), direct branch statements
+  only, with `elif` chains compared as one family of siblings. The dangling
+  W015 rule comment that handed the general case to the now-closed #396/#404
+  now points at #870 as the open tracker.
+
 ## [0.39.0] - 2026-08-10
 
 ### Fixed

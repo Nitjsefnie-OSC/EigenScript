@@ -1,0 +1,7 @@
+define f(flag) as:
+    if flag == 1:
+        local t is 1
+    else:
+        t is 2           # sibling branch, no `local` -> writes outward
+    return t
+print of (str of (f of 0))
