@@ -602,8 +602,12 @@ jobs:
       - if: needs.scope.outputs.code == 'true'
         name: Installed-layout module and bundle suite subset (#905)
         run: |
-          export EIGENSCRIPT="$HOME/.local/bin/eigenscript"
-          bash tests/run_install_smoke_subset.sh
+          if [ -f tests/run_install_smoke_subset.sh ]; then
+            export EIGENSCRIPT="$HOME/.local/bin/eigenscript"
+            bash tests/run_install_smoke_subset.sh
+          else
+            echo "SKIP: #905 installed-layout module and bundle suite subset — tests/run_install_smoke_subset.sh is not present on this ref"
+          fi
 
   # Performance regression gate (#398). Wall-clock flakes on shared runners, so
   # the gate compares deterministic cachegrind instruction counts (Ir) of THIS
