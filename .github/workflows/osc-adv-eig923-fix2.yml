@@ -43,4 +43,7 @@ jobs:
               > "$work/$cc.out" 2>&1 || status=$?
             echo "${cc}_status=$status"
             sed "s|^|${cc}: |" "$work/$cc.out"
+
+      - name: Run werror-switch self-test directly
+        run: bash tools/werror_switch_check.sh --selftest
           done
