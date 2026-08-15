@@ -1,0 +1,27 @@
+name: osc-adv-eig923-f81638b
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: Exact commit, branch, or tag to self-test
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  werror-selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: "${{ inputs.target_ref }}"
+
+      - name: Identify tested tree
+        run: git rev-parse HEAD
+
+      - name: Run werror-switch self-test directly
+        run: bash tools/werror_switch_check.sh --selftest
