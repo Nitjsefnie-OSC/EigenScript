@@ -1,0 +1,81 @@
+name: osc-adv-eig923-fix3
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: Commit, branch, or tag to test
+        required: true
+        type: string
+      mode:
+        description: Run the unchanged green control or neutralize mutation 1
+        required: true
+        type: choice
+        options:
+          - green
+          - red
+
+permissions:
+  contents: read
+
+jobs:
+  werror-selftest:
+    name: werror self-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: "${{ inputs.target_ref }}"
+          fetch-depth: 0
+
+      - name: Identify tested tree
+        run: |
+          set -eu
+          echo "ref: ${{ inputs.target_ref }}"
+          git rev-parse HEAD
+
+      - name: Capture GCC and Clang generated-header diagnostics
+        run: |
+          set -eu
+          work=$(mktemp -d)
+          trap 'rm -rf -- "$work"' EXIT
+          bash tools/gen_lsp_builtin_index.sh "$work/lsp_builtin_index.h"
+          sed 's|ext_names.h; hover text|lib/*.eigs; hover text|' \
+            "$work/lsp_builtin_index.h" > "$work/lsp_builtin_index.h.mutated"
+          mv "$work/lsp_builtin_index.h.mutated" "$work/lsp_builtin_index.h"
+          for cc in gcc clang; do
+            status=0
+            "$cc" -Werror=comment -fsyntax-only \
+              -include "$work/lsp_builtin_index.h" src/main.c \
+              > "$work/$cc.out" 2>&1 || status=$?
+            echo "${cc}_status=$status"
+            sed "s|^|${cc}: |" "$work/$cc.out"
+          done
+
+      - name: Neutralize mutation 1 for the red probe
+        if: inputs.mode == 'red'
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("tools/werror_switch_check.sh")
+          source = path.read_text()
+          marker = "    # Compiler-variable spelling: retain the other bare $CC calls so the\n"
+          replacement = (
+              "    # Probe-only control: neutralize mutation 1 after its planting sentinel;\n"
+              "    # mutation 2 remains planted for the detector-isolation check.\n"
+              "    cp tools/gen_lsp_builtin_index.sh \\\n"
+              "        \"$st_fault_tree/tools/gen_lsp_builtin_index.sh\"\n\n"
+          )
+          if source.count(marker) != 1:
+              raise SystemExit("mutation-1 insertion marker was not unique")
+          path.write_text(source.replace(marker, replacement + marker, 1))
+          PY
+
+      - name: Run unchanged green self-test
+        if: inputs.mode == 'green'
+        run: CC=gcc bash tools/werror_switch_check.sh --selftest
+
+      - name: Run red self-test probe
+        if: inputs.mode == 'red'
+        run: CC=gcc bash tools/werror_switch_check.sh --selftest
