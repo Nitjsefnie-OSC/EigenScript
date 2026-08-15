@@ -1,0 +1,45 @@
+name: osc-adv-eig923-delta3-macos
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: Commit, branch, or tag to inspect
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  comment-diagnostic:
+    name: macOS Clang comment diagnostic
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: "${{ inputs.target_ref }}"
+          fetch-depth: 0
+
+      - name: Identify tested tree
+        run: |
+          set -eu
+          echo "ref: ${{ inputs.target_ref }}"
+          git rev-parse HEAD
+
+      - name: Capture Apple Clang generated-header diagnostic
+        run: |
+          set -eu
+          work=$(mktemp -d)
+          trap 'rm -rf -- "$work"' EXIT
+          clang --version
+          bash tools/gen_lsp_builtin_index.sh "$work/lsp_builtin_index.h"
+          sed 's|ext_names.h; hover text|lib/*.eigs; hover text|' \
+            "$work/lsp_builtin_index.h" > "$work/lsp_builtin_index.h.mutated"
+          mv "$work/lsp_builtin_index.h.mutated" "$work/lsp_builtin_index.h"
+          status=0
+          clang -Werror=comment -fsyntax-only \
+            -include "$work/lsp_builtin_index.h" src/main.c \
+            > "$work/clang.out" 2>&1 || status=$?
+          echo "apple_clang_status=$status"
+          sed 's/^/apple-clang: /' "$work/clang.out"
