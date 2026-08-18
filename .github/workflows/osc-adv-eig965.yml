@@ -1,0 +1,42 @@
+name: osc-adv-eig965
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: Commit, branch, or tag to test
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  sandbox-budget-detail:
+    name: sandbox budget assertions (full output)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: "${{ inputs.target_ref }}"
+          fetch-depth: 0
+
+      - name: Identify tested tree
+        run: |
+          set -eu
+          echo "ref: ${{ inputs.target_ref }}"
+          git rev-parse HEAD
+
+      - name: Build
+        run: ./build.sh
+
+      # The suite runner truncates failure detail to five grep-matched lines,
+      # which the older tests' expected stderr consumes. Run the budget file
+      # directly so every FAIL: assertion line is visible. Exit code is the
+      # file's own (test_summary): nonzero when any assertion failed.
+      - name: Run tests/test_sandbox_budget.eigs with untruncated output
+        run: |
+          set -o pipefail
+          cd src
+          ./eigenscript ../tests/test_sandbox_budget.eigs </dev/null 2>&1 | tee budget.out
+          exit "${PIPESTATUS[0]}"
