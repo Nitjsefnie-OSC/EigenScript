@@ -1,0 +1,139 @@
+name: osc-adv-870-stack
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: Exact candidate or mutant commit to probe
+        required: true
+        type: string
+      expect_stack_kill:
+        description: Treat a nonzero 64 KiB probe exit as the expected mutant kill
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  w023-stack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact target
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.target_ref }}
+          fetch-depth: 0
+
+      - name: Bind checkout provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual=$(git rev-parse HEAD)
+          test "$actual" = "${{ inputs.target_ref }}"
+          echo "STACK_PROBE_CHECKOUT=$actual"
+
+      - name: Build the runtime library
+        run: make lib
+
+      - name: Build a heap-context lint probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/w023_stack_probe.c <<'EOF'
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include "eigenscript.h"
+          #include "eigs_embed.h"
+          #include "lint_internal.h"
+
+          static char *read_source(const char *path) {
+              FILE *f = fopen(path, "rb");
+              long n;
+              char *s;
+              if (!f || fseek(f, 0, SEEK_END) != 0) return NULL;
+              n = ftell(f);
+              if (n < 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
+              s = malloc((size_t)n + 1);
+              if (!s || fread(s, 1, (size_t)n, f) != (size_t)n) {
+                  free(s); fclose(f); return NULL;
+              }
+              s[n] = '\0';
+              fclose(f);
+              return s;
+          }
+
+          int main(int argc, char **argv) {
+              char *source;
+              TokenList tokens;
+              ASTNode *ast;
+              LintContext *ctx;
+              EigsState *state;
+              int w023 = 0;
+              if (argc != 2 || !(source = read_source(argv[1]))) return 2;
+              state = eigs_state_new();
+              if (!state || !eigs_thread_attach(state)) return 2;
+              g_parse_errors = 0;
+              tokens = tokenize(source);
+              ast = parse(&tokens);
+              if (g_parse_errors != 0) return 3;
+              ctx = calloc(1, sizeof(*ctx));
+              if (!ctx) return 2;
+              lint_run_checks(ast, NULL, source, ctx);
+              for (int i = 0; i < ctx->warning_count; i++)
+                  if (strcmp(ctx->warnings[i].code, "W023") == 0) w023 = 1;
+              printf("W023 stack probe warnings=%d\n", w023);
+              free(ctx);
+              free_ast(ast);
+              free_tokenlist(&tokens);
+              free(source);
+              eigs_thread_detach();
+              eigs_state_destroy(state);
+              return w023 ? 1 : 0;
+          }
+          EOF
+          cc -Wall -Wextra -Werror -Isrc -o /tmp/w023_stack_probe \
+            /tmp/w023_stack_probe.c libeigenscript.a -lm -lpthread
+
+      - name: Run nested W023 proof under a 64 KiB process stack
+        shell: bash
+        env:
+          EXPECT_STACK_KILL: ${{ inputs.expect_stack_kill }}
+        run: |
+          set -uo pipefail
+          cat > /tmp/w023_stack_case.eigs <<'EIGS'
+          t is 5
+          define f(flag) as:
+              local t is 1
+          EIGS
+          indent='    '
+          i=0
+          while [ "$i" -lt 18 ]; do
+              printf '%sif 1 == 1:\n' "$indent" >> /tmp/w023_stack_case.eigs
+              indent="${indent}    "
+              i=$((i + 1))
+          done
+          printf '%sif flag == 1:\n' "$indent" >> /tmp/w023_stack_case.eigs
+          printf '%s    local t is 2\n' "$indent" >> /tmp/w023_stack_case.eigs
+          printf '%selse:\n' "$indent" >> /tmp/w023_stack_case.eigs
+          printf '%s    t is 3\n' "$indent" >> /tmp/w023_stack_case.eigs
+          cat >> /tmp/w023_stack_case.eigs <<'EIGS'
+              return t
+          EIGS
+          set +e
+          (ulimit -s 64; /tmp/w023_stack_probe /tmp/w023_stack_case.eigs) \
+            > /tmp/w023_stack_probe.log 2>&1
+          rc=$?
+          set -e
+          cat /tmp/w023_stack_probe.log
+          if [ "$EXPECT_STACK_KILL" = true ]; then
+              test "$rc" -ne 0
+              echo "EXPECTED_STACK_KILL rc=$rc"
+          else
+              test "$rc" -eq 0
+              grep -Fx 'W023 stack probe warnings=0' /tmp/w023_stack_probe.log
+              echo "STACK_PROBE_PASS rc=0"
+          fi
