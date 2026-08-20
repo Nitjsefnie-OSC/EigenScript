@@ -1,0 +1,115 @@
+name: osc-adv-964-sandbox-intern
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: Exact candidate or mutant commit to probe
+        required: true
+        type: string
+      mode:
+        description: Expect the fixed green result or the single-defect retention kill
+        required: true
+        type: choice
+        options:
+          - green
+          - red
+
+permissions:
+  contents: read
+
+jobs:
+  sandbox-intern-probe:
+    name: sandbox intern lifetime (${{ inputs.mode }})
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact target
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ inputs.target_ref }}
+          fetch-depth: 0
+
+      - name: Bind checkout provenance
+        shell: bash
+        env:
+          TARGET_REF: ${{ inputs.target_ref }}
+        run: |
+          set -euo pipefail
+          actual=$(git rev-parse HEAD)
+          test "$actual" = "$TARGET_REF"
+          echo "SANDBOX_964_CHECKOUT=$actual"
+
+      - name: Build and run the assertion probe
+        shell: bash
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          sources=$(make -s print-EMBED_SOURCES)
+          cc -Wall -Wextra -Werror=implicit-function-declaration -Werror=switch \
+            -Werror=comment -O0 -g -Isrc \
+            -DEIGENSCRIPT_EXT_HTTP=0 -DEIGENSCRIPT_EXT_MODEL=0 \
+            -DEIGENSCRIPT_EXT_DB=0 -DEIGENSCRIPT_VERSION='"0.0-test"' \
+            -o /tmp/eigs964_sandbox_intern tests/test_sandbox_intern_lifetime.c \
+            $sources -lm -lpthread
+          set +e
+          /tmp/eigs964_sandbox_intern > /tmp/eigs964_sandbox_intern.log 2>&1
+          rc=$?
+          set -e
+          cat /tmp/eigs964_sandbox_intern.log
+          if [ "$MODE" = green ]; then
+            test "$rc" -eq 0
+            grep -Eq 'sandbox_only=[0-8]([^0-9]|$)' /tmp/eigs964_sandbox_intern.log
+            if grep -Fq 'escaped result=' /tmp/eigs964_sandbox_intern.log; then
+              echo "escaped-result control failed"
+              exit 1
+            fi
+            echo "SANDBOX_964_GREEN_PASS rc=$rc"
+          else
+            test "$rc" -ne 0
+            grep -Fq 'Assertion `sandbox_retained <= 8` failed' \
+              /tmp/eigs964_sandbox_intern.log
+            if grep -Fq 'escaped result=' /tmp/eigs964_sandbox_intern.log; then
+              echo "escaped-result control failed before mutant kill"
+              exit 1
+            fi
+            echo "SANDBOX_964_MUTANT_KILL rc=$rc"
+          fi
+
+  sandbox-intern-asan-ubsan:
+    name: sandbox intern lifetime (asan + ubsan)
+    if: inputs.mode == 'green'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact target
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ inputs.target_ref }}
+          fetch-depth: 0
+
+      - name: Bind checkout provenance
+        shell: bash
+        env:
+          TARGET_REF: ${{ inputs.target_ref }}
+        run: |
+          set -euo pipefail
+          actual=$(git rev-parse HEAD)
+          test "$actual" = "$TARGET_REF"
+          echo "SANDBOX_964_ASAN_UBSAN_CHECKOUT=$actual"
+
+      - name: Build and run under AddressSanitizer and UBSan
+        shell: bash
+        run: |
+          set -euo pipefail
+          sources=$(make -s print-EMBED_SOURCES)
+          cc -Wall -Wextra -Werror=implicit-function-declaration -Werror=switch \
+            -Werror=comment -O0 -g -fno-omit-frame-pointer \
+            -fsanitize=address,undefined -Isrc \
+            -DEIGENSCRIPT_EXT_HTTP=0 -DEIGENSCRIPT_EXT_MODEL=0 \
+            -DEIGENSCRIPT_EXT_DB=0 -DEIGENSCRIPT_VERSION='"0.0-test"' \
+            -o /tmp/eigs964_sandbox_intern_asan \
+            tests/test_sandbox_intern_lifetime.c $sources -lm -lpthread
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
+            UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+            /tmp/eigs964_sandbox_intern_asan
+          echo "SANDBOX_964_ASAN_UBSAN_PASS"
