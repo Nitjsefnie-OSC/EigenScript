@@ -1,0 +1,33 @@
+name: osc-adv-870-stack-cli
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: Commit, branch, or tag to test
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  linux:
+    name: linux / cli-stack-probe
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/nitjsefnie-osc/eigenscript-dev:ci-main
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: "${{ inputs.target_ref }}"
+      - name: Build
+        run: CC=gcc ./build.sh
+      - name: Verify checkout
+        run: test "$(git rev-parse HEAD)" = "${{ inputs.target_ref }}"
+      - name: Run constrained CLI lint probe
+        run: EIGS_W023_STACK_PROBE=1 bash tests/test_lint.sh
