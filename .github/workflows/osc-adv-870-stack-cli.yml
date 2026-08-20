@@ -28,6 +28,8 @@ jobs:
       - name: Build
         run: CC=gcc ./build.sh
       - name: Verify checkout
-        run: test "$(git rev-parse HEAD)" = "${{ inputs.target_ref }}"
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = "${{ inputs.target_ref }}"
       - name: Run constrained CLI lint probe
         run: EIGS_W023_STACK_PROBE=1 bash tests/test_lint.sh
